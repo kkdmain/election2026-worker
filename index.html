@@ -4654,46 +4654,79 @@ function App() {
       return next || [];
     });
   };
+  const applyDbSnapshot = useCallback(async (db, cancelledRef={ current:false }) => {
+    if (!db || cancelledRef.current) return;
+    setConstituencies(db.constituencies || []);
+    setCandidates(db.candidates || []);
+    setTicker(db.ticker || []);
+    setAnnouncements(db.announcements || []);
+    if (db.rawRoundRows) updateRawRoundRows(db.rawRoundRows);
+    if (db.settings) setSettings(db.settings);
+
+    if (db._phase2) {
+      const [segRows, userRows, imageRows] = await db._phase2;
+      if (cancelledRef.current) return;
+      const nextSegments = (segRows || []).map(dbToSegment);
+      const nextUsers = (userRows || []).map(dbToUser);
+      const imageCandidates = hydrateCandidateImages(db.candidates, imageRows);
+      setSegments(nextSegments);
+      setUsers(nextUsers);
+      setCandidates(imageCandidates);
+      saveDbCache({
+        constituencies: db.constituencies,
+        candidates: imageCandidates,
+        segments: nextSegments,
+        ticker: db.ticker,
+        announcements: db.announcements,
+        users: nextUsers,
+        settings: db.settings,
+      });
+    }
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
+    const cancelledRef = { current:false };
     if (cachedDb) setDbLoading(false);
     loadAllFromDB().then(db => {
-      if (cancelled) return;
+      if (cancelledRef.current) return;
       if (db) {
-        setConstituencies(db.constituencies || []);
-        setCandidates(db.candidates || []);
-        setTicker(db.ticker || []);
-        setAnnouncements(db.announcements || []);
-        if (db.rawRoundRows) updateRawRoundRows(db.rawRoundRows);
-        if (db.settings) setSettings(db.settings);
-        else supaUpsert('app_settings', settingsToDb(DEFAULT_SETTINGS));
-        // Phase 2: load segments + users in background after UI is visible
-        if (db._phase2) {
-          db._phase2.then(([segRows, userRows, imageRows]) => {
-            if (cancelled) return;
-            if (segRows) setSegments(segRows.map(dbToSegment));
-            if (userRows) setUsers(userRows.map(dbToUser));
-            const imageCandidates = hydrateCandidateImages(db.candidates, imageRows);
-            setCandidates(imageCandidates);
-            // Save full cache only after phase 2 completes
-            const fullDb = {
-              constituencies: db.constituencies,
-              candidates: imageCandidates,
-              segments: (segRows||[]).map(dbToSegment),
-              ticker: db.ticker,
-              announcements: db.announcements,
-              users: (userRows||[]).map(dbToUser),
-              settings: db.settings,
-            };
-            saveDbCache(fullDb);
-          });
-        }
+        applyDbSnapshot(db, cancelledRef);
+        if (!db.settings) supaUpsert('app_settings', settingsToDb(DEFAULT_SETTINGS));
       }
       setDbLoading(false);
     }).catch(() => setDbLoading(false));
-    return () => { cancelled = true; };
-  }, []);
+    return () => { cancelledRef.current = true; };
+  }, [applyDbSnapshot]);
+
+  // Poll every 30 seconds so other-device vote updates appear even when
+  // Supabase realtime is unavailable or not enabled on the current database.
+  useEffect(() => {
+    if (!supa) return;
+    const cancelledRef = { current:false };
+    let running = false;
+    const refreshFromDB = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const db = await loadAllFromDB();
+        if (db) await applyDbSnapshot(db, cancelledRef);
+      } catch (e) {
+        console.warn('30s DB poll failed', e);
+      } finally {
+        running = false;
+      }
+    };
+    const pollTimer = setInterval(refreshFromDB, 30000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') refreshFromDB();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      cancelledRef.current = true;
+      clearInterval(pollTimer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [applyDbSnapshot]);
 
   useEffect(() => {
     if (dbLoading || !user) return;
